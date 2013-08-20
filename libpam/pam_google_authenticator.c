@@ -29,6 +29,9 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 
 #ifdef linux
 // We much rather prefer to use setfsuid(), but this function is unfortunately
@@ -56,6 +59,7 @@
 
 #define MODULE_NAME "pam_google_authenticator"
 #define SECRET      "~/.google_authenticator"
+#define WHITELISTIPS    "~/.google_authenticator.whitelist"
 
 typedef struct Params {
   const char *secret_filename_spec;
@@ -131,6 +135,18 @@ static const char *get_user_name(pam_handle_t *pamh) {
     return NULL;
   }
   return username;
+}
+
+static const char *get_rhost_name(pam_handle_t *pamh) {
+  // Obtain the user's name
+  const char *rhost;
+  if (pam_get_item(pamh, PAM_RHOST, (void *)&rhost) != PAM_SUCCESS ||
+      !rhost || !*rhost) {
+    log_message(LOG_ERR, pamh,
+                "No remote host name available when checking verification code");
+    return NULL;
+  }
+  return rhost;
 }
 
 static char *get_secret_filename(pam_handle_t *pamh, const Params *params,
@@ -221,6 +237,95 @@ static char *get_secret_filename(pam_handle_t *pamh, const Params *params,
   *uid = params->fixed_uid ? params->uid : pw->pw_uid;
   free(buf);
   return secret_filename;
+}
+
+static char *get_whitelist_filename(pam_handle_t *pamh, const Params *params,
+                                 const char *username, int *uid) {
+  // Check whether the administrator decided to override the default location
+  // for the secret file.
+  const char *spec = WHITELISTIPS;
+
+  // Obtain the user's id and home directory
+  struct passwd pwbuf, *pw = NULL;
+  char *buf = NULL;
+  char *whitelist_filename = NULL;
+  if (!params->fixed_uid) {
+    #ifdef _SC_GETPW_R_SIZE_MAX
+    int len = sysconf(_SC_GETPW_R_SIZE_MAX);
+    if (len <= 0) {
+      len = 4096;
+    }
+    #else
+    int len = 4096;
+    #endif
+    buf = malloc(len);
+    *uid = -1;
+    if (buf == NULL ||
+        getpwnam_r(username, &pwbuf, buf, len, &pw) ||
+        !pw ||
+        !pw->pw_dir ||
+        *pw->pw_dir != '/') {
+    err:
+      log_message(LOG_ERR, pamh, "Failed to compute location of white list configuration file");
+      free(buf);
+      free(whitelist_filename);
+      return NULL;
+    }
+  }
+
+  // Expand filename specification to an actual filename.
+  if ((whitelist_filename = strdup(spec)) == NULL) {
+    goto err;
+  }
+  int allow_tilde = 1;
+  for (int offset = 0; whitelist_filename[offset];) {
+    char *cur = whitelist_filename + offset;
+    char *var = NULL;
+    size_t var_len = 0;
+    const char *subst = NULL;
+    if (allow_tilde && *cur == '~') {
+      var_len = 1;
+      if (!pw) {
+        goto err;
+      }
+      subst = pw->pw_dir;
+      var = cur;
+    } else if (whitelist_filename[offset] == '$') {
+      if (!memcmp(cur, "${HOME}", 7)) {
+        var_len = 7;
+        if (!pw) {
+          goto err;
+        }
+        subst = pw->pw_dir;
+        var = cur;
+      } else if (!memcmp(cur, "${USER}", 7)) {
+        var_len = 7;
+        subst = username;
+        var = cur;
+      }
+    }
+    if (var) {
+      size_t subst_len = strlen(subst);
+      char *resized = realloc(whitelist_filename,
+                              strlen(whitelist_filename) + subst_len);
+      if (!resized) {
+        goto err;
+      }
+      var += resized - whitelist_filename;
+      whitelist_filename = resized;
+      memmove(var + subst_len, var + var_len, strlen(var + var_len) + 1);
+      memmove(var, subst, subst_len);
+      offset = var + subst_len - resized;
+      allow_tilde = 0;
+    } else {
+      allow_tilde = *cur == '/';
+      ++offset;
+    }
+  }
+
+  *uid = params->fixed_uid ? params->uid : pw->pw_uid;
+  free(buf);
+  return whitelist_filename;
 }
 
 static int setuser(int uid) {
@@ -1329,12 +1434,19 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   int        rc = PAM_SESSION_ERR;
   const char *username;
   char       *secret_filename = NULL;
+  char       *whitelist_filename = NULL;
+  const char *rhost = NULL;
   int        uid = -1, old_uid = -1, old_gid = -1, fd = -1;
   off_t      filesize = 0;
   time_t     mtime = 0;
   char       *buf = NULL;
   uint8_t    *secret = NULL;
   int        secretLen = 0;
+  char       *subnet = NULL, *tempbuf1 = NULL, *tokenbuf1 = NULL,*ripaddr;
+  const char nldelim = '\n';
+  unsigned int p1, p2, p3, p4, prefix;
+  unsigned long mask,ipaddr;
+  struct addrinfo *result, *res;
 
 #if defined(DEMO) || defined(TESTING)
   *error_msg = '\000';
@@ -1348,8 +1460,42 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
 
   // Read and process status file, then ask the user for the verification code.
   int early_updated = 0, updated = 0;
-  if ((username = get_user_name(pamh)) &&
-      (secret_filename = get_secret_filename(pamh, &params, username, &uid)) &&
+  if((username = get_user_name(pamh))){
+      if((whitelist_filename=get_whitelist_filename(pamh, &params, username, &uid)) &&
+              (rhost=get_rhost_name(pamh)) &&
+              (fd = open_secret_file(pamh, whitelist_filename, &params, username, uid, &filesize, &mtime)) &&
+              (buf = read_file_contents(pamh, whitelist_filename, &fd, filesize))){
+          log_message(LOG_INFO, pamh,"a white list configuration is found. Remote host %s will be checked", rhost);          
+          getaddrinfo(rhost, NULL, NULL, &result);
+          for(tempbuf1 = buf; ; tempbuf1 = NULL){
+              subnet = strtok_r(tempbuf1, &nldelim, &tokenbuf1);
+              if(subnet == NULL){
+                  break;
+              }
+              p1=p2=p3=p4=prefix=0;
+              sscanf(subnet, "%d.%d.%d.%d/%d", &p1 , &p2, &p3, &p4, &prefix);
+              mask = p4 + (p3<<8) + (p2<<16) + (p1<<24);
+              mask = (mask >> (32-prefix));
+              for(res = result; res != NULL; res = res->ai_next){
+                  ripaddr = inet_ntoa(((struct sockaddr_in*)res->ai_addr)->sin_addr);
+                  sscanf(ripaddr, "%d.%d.%d.%d", &p1 , &p2, &p3, &p4);
+                  ipaddr = p4 + (p3<<8) + (p2<<16) + (p1<<24);
+                  ipaddr = (ipaddr >> (32 - prefix));
+                  if(ipaddr == mask){
+                      log_message(LOG_INFO, pamh, "The remote host %s is in white list. No need verification.", rhost);
+                      return PAM_SUCCESS;
+                  }
+              }
+          }
+          freeaddrinfo(result);
+      } else {
+          log_message(LOG_DEBUG,pamh,"No white list configuration nor remote host");
+      }
+      uid = fd = -1;
+      filesize = 0;
+      mtime = 0;
+      buf = NULL;
+  if ((secret_filename = get_secret_filename(pamh, &params, username, &uid)) &&
       !drop_privileges(pamh, username, uid, &old_uid, &old_gid) &&
       (fd = open_secret_file(pamh, secret_filename, &params, username, uid,
                              &filesize, &mtime)) >= 0 &&
@@ -1523,6 +1669,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
       log_message(LOG_ERR, pamh, "Invalid verification code");
     }
   }
+}
 
   // If the user has not created a state file with a shared secret, and if
   // the administrator set the "nullok" option, this PAM module completes
