@@ -1442,11 +1442,10 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   char       *buf = NULL;
   uint8_t    *secret = NULL;
   int        secretLen = 0;
-  char       *subnet = NULL, *tempbuf1 = NULL, *tokenbuf1 = NULL,*ripaddr;
-  const char nldelim = '\n';
-  unsigned int p1, p2, p3, p4, prefix;
+  unsigned int prefix;
   unsigned long mask,ipaddr;
   struct addrinfo *result, *res;
+  struct in_addr addr;
 
 #if defined(DEMO) || defined(TESTING)
   *error_msg = '\000';
@@ -1464,30 +1463,47 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
       if((whitelist_filename=get_whitelist_filename(pamh, &params, username, &uid)) &&
               (rhost=get_rhost_name(pamh)) &&
               (fd = open_secret_file(pamh, whitelist_filename, &params, username, uid, &filesize, &mtime)) &&
-              (buf = read_file_contents(pamh, whitelist_filename, &fd, filesize))){
-          log_message(LOG_INFO, pamh,"a white list configuration is found. Remote host %s will be checked", rhost);          
-          getaddrinfo(rhost, NULL, NULL, &result);
-          for(tempbuf1 = buf; ; tempbuf1 = NULL){
-              subnet = strtok_r(tempbuf1, &nldelim, &tokenbuf1);
-              if(subnet == NULL){
-                  break;
-              }
-              p1=p2=p3=p4=prefix=0;
-              sscanf(subnet, "%d.%d.%d.%d/%d", &p1 , &p2, &p3, &p4, &prefix);
-              mask = p4 + (p3<<8) + (p2<<16) + (p1<<24);
-              mask = (mask >> (32-prefix));
-              for(res = result; res != NULL; res = res->ai_next){
-                  ripaddr = inet_ntoa(((struct sockaddr_in*)res->ai_addr)->sin_addr);
-                  sscanf(ripaddr, "%d.%d.%d.%d", &p1 , &p2, &p3, &p4);
-                  ipaddr = p4 + (p3<<8) + (p2<<16) + (p1<<24);
-                  ipaddr = (ipaddr >> (32 - prefix));
-                  if(ipaddr == mask){
-                      log_message(LOG_INFO, pamh, "The remote host %s is in white list. No need verification.", rhost);
-                      return PAM_SUCCESS;
-                  }
-              }
-          }
-          freeaddrinfo(result);
+              (buf = read_file_contents(pamh, whitelist_filename, &fd, filesize))) {
+            log_message(LOG_INFO, pamh, "a white list configuration is found. Remote host %s will be checked", rhost);
+            getaddrinfo(rhost, NULL, NULL, &result);
+            char ipaddrbuf[16];
+            char prefixbuf[3];
+            memset(ipaddrbuf, 0, 16);
+            memset(prefixbuf, 0, 3);
+            char * tmp = ipaddrbuf;
+            int j = 0;
+            for (int i = 0; i < filesize; i++) {
+                if (buf[i] == '\r') {
+                    continue;
+                } else if (buf[i] == '\n') {
+                    inet_aton(ipaddrbuf, &addr);
+                    prefix = atoi(prefixbuf);
+                    mask = htonl(addr.s_addr);
+                    mask = (mask >> (32 - prefix));
+                    for (res = result; res != NULL; res = res->ai_next) {
+                        if (res->ai_family != AF_INET) {
+                            continue;
+                        }
+                        ipaddr = ((struct sockaddr_in*) res->ai_addr)->sin_addr.s_addr;
+                        ipaddr = htonl(ipaddr);
+                        ipaddr = (ipaddr >> (32 - prefix));
+                        if (ipaddr == mask) {
+                            log_message(LOG_INFO, pamh, "The remote host %s is in white list. No need verification.", rhost);
+                            return PAM_SUCCESS;
+                        }
+                    }
+                    memset(ipaddrbuf, 0, 16);
+                    memset(prefixbuf, 0, 3);
+                    tmp = ipaddrbuf;
+                    j = 0;
+                } else if (buf[i] == '/') {
+                    j = 0;
+                    tmp = prefixbuf;
+                } else {
+                    tmp[j++] = buf[i];
+                }
+            }
+            freeaddrinfo(result);
       } else {
           log_message(LOG_DEBUG,pamh,"No white list configuration nor remote host");
       }
