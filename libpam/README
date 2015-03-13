@@ -1,7 +1,12 @@
 Example PAM module demonstrating two-factor authentication.
 
-Build and install by running "make install". If you don't have access to
-"sudo", you have to manually become "root" prior to calling "make install".
+Build & install by running:
+ * ./bootstrap.sh
+ * ./configure
+ * make
+ * make install
+If you don't have access to "sudo", you have to manually become "root" prior
+to calling "make install".
 
 Then add this line to your PAM configuration file:
   auth required pam_google_authenticator.so
@@ -48,10 +53,10 @@ password, you either have to re-arrange the entries in the PAM configuration
 file to decrypt the home directory prior to asking for the OTP code, or
 you have to store the secret file in a non-standard location:
 
-  auth required pam_google_authenticator.so secret=/var/unencrypted-home/${USER}/.google-authenticator
+  auth required pam_google_authenticator.so secret=/var/unencrypted-home/${USER}/.google_authenticator
 
 would be a possible choice. Make sure to set appropriate permissions. You also
-have to tell your users to manually move their .google-authenticator file to
+have to tell your users to manually move their .google_authenticator file to
 this location.
 
 In addition to "${USER}", the "secret=" option also recognizes both "~" and
